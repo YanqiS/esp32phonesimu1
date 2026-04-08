@@ -70,7 +70,7 @@ typedef enum {
 
 static call_state_t current_call_state = CALL_STATE_IDLE;
 static char current_phone_number[32] = "";
-static TimerHandle_t ring_timer = NULL;
+// static TimerHandle_t ring_timer = NULL;
 
 typedef struct
 {
@@ -385,16 +385,16 @@ static void led_task(void *arg)
 
 /* ===================== 呼叫管理 ===================== */
 
-// 定时发送RING
-static void ring_timer_callback(TimerHandle_t xTimer)
-{
-    if (current_call_state == CALL_STATE_INCOMING && hfp_connected)
-    {
-        ESP_LOGI(TAG, "🔔 发送RING...");
-        // 持续发送呼叫指示
-        esp_hf_ag_ciev_report(connected_device, ESP_HF_IND_TYPE_CALL, 1);
-    }
-}
+// // 定时发送RING
+// static void ring_timer_callback(TimerHandle_t xTimer)
+// {
+//     if (current_call_state == CALL_STATE_INCOMING && hfp_connected)
+//     {
+//         ESP_LOGI(TAG, "🔔 发送RING...");
+//         // 持续发送呼叫指示
+//         esp_hf_ag_ciev_report(connected_device, ESP_HF_IND_TYPE_CALL, 1);
+//     }
+// }
 
 // 模拟来电
 void simulate_incoming_call(const char *phone_number)
@@ -428,18 +428,21 @@ void simulate_incoming_call(const char *phone_number)
     // 更新LED
     led_mode = 3; // 绿灯快闪
 
-    // 发送状态指示 - 来电中
-    // 使用ciev_report发送单独的指示器
-    sync_hfp_call_indicators(0, 1);
+    // 关键修复：用 esp_hf_ag_answer_call 把 setup 切到 INCOMING。
+    // 虽然函数名叫 answer_call，实际上它是 AG call-state 变更的统一入口。
+    // stack 内部会根据 (call=0, setup=INCOMING) 自动发出 +CIEV callsetup=1、
+    // RING 以及 +CLIP:"<num>",129，车机才会弹出来电界面。
+    // 之前直接调用 ciev_report 不会走 RING/CLIP 的发送流程。
+    esp_hf_ag_answer_call(
+        connected_device,
+        0,                                    // num_active
+        0,                                    // num_held
+        ESP_HF_CALL_STATUS_NO_CALLS,          // call = 0
+        ESP_HF_CALL_SETUP_STATUS_INCOMING,    // callsetup = 1 (触发 RING/CLIP)
+        current_phone_number,
+        ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
 
-    // 启动RING定时器（每3秒发送一次）
-    if (ring_timer == NULL)
-    {
-        ring_timer = xTimerCreate("ring", pdMS_TO_TICKS(3000), pdTRUE, NULL, ring_timer_callback);
-    }
-    xTimerStart(ring_timer, 0);
-
-    ESP_LOGI(TAG, "💡 等待车机接听/拒接...");
+    ESP_LOGI(TAG, "💡 已通知车机来电，stack 会自动发送 RING/+CLIP，等待车机接听/拒接...");
 }
 
 // 接听来电
@@ -472,7 +475,7 @@ void handle_call_answer(void)
             current_phone_number,
             ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
 
-        sync_hfp_call_indicators(1, 0);
+        // sync_hfp_call_indicators(1, 0);
         esp_hf_ag_audio_connect(connected_device);
         ESP_LOGI(TAG, "🎙️ 已切换到通话中，等待音频链路建立...");
         return;
@@ -488,11 +491,11 @@ void handle_call_answer(void)
     }
     ESP_LOGI(TAG, "✅ ===============================");
 
-    // 停止RING
-    if (ring_timer != NULL)
-    {
-        xTimerStop(ring_timer, 0);
-    }
+    // // 停止RING
+    // if (ring_timer != NULL)
+    // {
+    //     xTimerStop(ring_timer, 0);
+    // }
 
     current_call_state = CALL_STATE_ACTIVE;
     led_mode = 4; // 红灯常亮
@@ -508,8 +511,8 @@ void handle_call_answer(void)
         ESP_HF_CALL_ADDR_TYPE_UNKNOWN
     );
 
-    // 发送呼叫状态更新
-    sync_hfp_call_indicators(1, 0);
+    // // 发送呼叫状态更新
+    // sync_hfp_call_indicators(1, 0);
 
     // 建立SCO音频连接
     esp_hf_ag_audio_connect(connected_device);
@@ -531,11 +534,11 @@ void handle_call_reject(void)
     ESP_LOGI(TAG, "❌ 电话号码: %s", current_phone_number);
     ESP_LOGI(TAG, "❌ ===============================");
 
-    // 停止RING
-    if (ring_timer != NULL)
-    {
-        xTimerStop(ring_timer, 0);
-    }
+    // // 停止RING
+    // if (ring_timer != NULL)
+    // {
+    //     xTimerStop(ring_timer, 0);
+    // }
 
     current_call_state = CALL_STATE_IDLE;
     led_mode = 2; // 绿灯常亮
@@ -634,13 +637,9 @@ void handle_call_dial(const char *number)
         0,                                    // num_active=0
         0,                                    // num_held=0
         ESP_HF_CALL_STATUS_NO_CALLS,
-        ESP_HF_CALL_SETUP_STATUS_OUTGOING_DIALING,
-        (char *)number,
-        ESP_HF_CALL_ADDR_TYPE_UNKNOWN
-    );
-
-    // 发送callsetup=2 (外拨中)
-    sync_hfp_call_indicators(0, 2);
+        ESP_HF_CALL_SETUP_STATUS_OUTGOING_DIALING,    // 2
+        current_phone_number,
+        ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
 
     // 模拟对方振铃
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -648,7 +647,14 @@ void handle_call_dial(const char *number)
     {
         current_call_state = CALL_STATE_ALERTING;
         ESP_LOGI(TAG, "📞 对方振铃中...");
-        sync_hfp_call_indicators(0, 3);
+        esp_hf_ag_out_call(
+            connected_device,
+            0,
+            0,
+            ESP_HF_CALL_STATUS_NO_CALLS,
+            ESP_HF_CALL_SETUP_STATUS_OUTGOING_ALERTING, // 3
+            current_phone_number,
+            ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
     }
 
     ESP_LOGI(TAG, "💡 等待对端接听：板子旋钮2→0可接通，旋钮3→0可取消");
@@ -687,6 +693,18 @@ static void hfp_ag_callback(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
             ESP_LOGI(TAG, "");
 
             sync_hfp_call_indicators(0, 0);
+             
+            // 开启 In-Band Ring Tone 通知。许多车机 (BMW/VW/丰田等) 需要
+            // 收到 +BSIR: 1 后才会打开来电界面并愿意建立 SCO 音频通道。
+            esp_err_t bsir_ret = esp_hf_ag_bsir(connected_device, ESP_HF_IN_BAND_RINGTONE_PROVIDED);
+            if (bsir_ret != ESP_OK)
+            {
+                ESP_LOGW(TAG, "BSIR 通知失败: %s", esp_err_to_name(bsir_ret));
+            }
+            else
+            {
+                ESP_LOGI(TAG, "✓ 已通知车机支持 In-Band Ring Tone");
+            }
         }
         else
         {
@@ -698,10 +716,10 @@ static void hfp_ag_callback(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
             ESP_LOGI(TAG, "HFP断开后恢复为可搜索状态，等待车机重新连接");
 
             // 停止RING
-            if (ring_timer != NULL)
-            {
-                xTimerStop(ring_timer, 0);
-            }
+            // if (ring_timer != NULL)
+            // {
+            //     xTimerStop(ring_timer, 0);
+            // }     
         }
         break;
     }
