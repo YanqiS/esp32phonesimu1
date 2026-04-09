@@ -72,6 +72,8 @@ static call_state_t current_call_state = CALL_STATE_IDLE;
 static char current_phone_number[32] = "";
 // static TimerHandle_t ring_timer = NULL;
 static TimerHandle_t dialing_alerting_timer = NULL;
+// 区分外拨来源：车机ATD(true) / ESP32主动发起(false)
+static bool outgoing_is_car_initiated = false;
 
 typedef struct
 {
@@ -412,14 +414,22 @@ static void dialing_alerting_timer_cb(TimerHandle_t xTimer)
     }
     current_call_state = CALL_STATE_ALERTING;
     ESP_LOGI(TAG, "📞 对方振铃中...");
-    esp_hf_ag_out_call(
-        connected_device,
-        0,
-        0,
-        ESP_HF_CALL_STATUS_NO_CALLS,
-        ESP_HF_CALL_SETUP_STATUS_OUTGOING_ALERTING,
-        current_phone_number,
-        ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+    if (outgoing_is_car_initiated)
+    {
+        esp_hf_ag_out_call(
+            connected_device,
+            0,
+            0,
+            ESP_HF_CALL_STATUS_NO_CALLS,
+            ESP_HF_CALL_SETUP_STATUS_OUTGOING_ALERTING,
+            current_phone_number,
+            ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+    }
+    else
+    {
+        // ESP32 发起：仅更新 CIEV callsetup=3（ALERTING）
+        sync_hfp_call_indicators(0, 3);
+    }
 }
 
 // 模拟来电
@@ -497,14 +507,22 @@ void handle_call_answer(void)
         current_call_state = CALL_STATE_ACTIVE;
         led_mode = 4;
 
-        esp_hf_ag_out_call(
-            connected_device,
-            1,
-            0,
-            ESP_HF_CALL_STATUS_CALL_IN_PROGRESS,
-            ESP_HF_CALL_SETUP_STATUS_IDLE,
-            current_phone_number,
-            ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+        if (outgoing_is_car_initiated)
+        {
+            esp_hf_ag_out_call(
+                connected_device,
+                1,
+                0,
+                ESP_HF_CALL_STATUS_CALL_IN_PROGRESS,
+                ESP_HF_CALL_SETUP_STATUS_IDLE,
+                current_phone_number,
+                ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+        }
+        else
+        {
+            // ESP32 发起外拨：仅更新 CIEV call=1, callsetup=0
+            sync_hfp_call_indicators(1, 0);
+        }
 
         // sync_hfp_call_indicators(1, 0);
         esp_hf_ag_audio_connect(connected_device);
@@ -586,6 +604,7 @@ void handle_call_reject(void)
     );
 
     sync_hfp_call_indicators(0, 0);
+    outgoing_is_car_initiated = false;
 
     memset(current_phone_number, 0, sizeof(current_phone_number));
     ESP_LOGI(TAG, "📵 来电已拒绝");
@@ -613,22 +632,29 @@ void handle_call_hangup(void)
     current_call_state = CALL_STATE_IDLE;
     led_mode = 2; // 绿灯常亮
 
-    // 发送挂断应答
-    esp_hf_ag_end_call(
-        connected_device,
-        0,                                    // num_active=0
-        0,                                    // num_held=0
-        ESP_HF_CALL_STATUS_NO_CALLS,
-        ESP_HF_CALL_SETUP_STATUS_IDLE,
-        current_phone_number,
-        ESP_HF_CALL_ADDR_TYPE_UNKNOWN
-    );
-
-    sync_hfp_call_indicators(0, 0);
+    if (outgoing_is_car_initiated)
+    {
+        // 车机 ATD 路径：保持原 end_call 行为
+        esp_hf_ag_end_call(
+            connected_device,
+            0,                                    // num_active=0
+            0,                                    // num_held=0
+            ESP_HF_CALL_STATUS_NO_CALLS,
+            ESP_HF_CALL_SETUP_STATUS_IDLE,
+            current_phone_number,
+            ESP_HF_CALL_ADDR_TYPE_UNKNOWN
+        );
+    }
+    else
+    {
+        // ESP32 主动外拨路径：只同步 CIEV 指标
+        sync_hfp_call_indicators(0, 0);
+    }
 
     // 断开SCO音频
     esp_hf_ag_audio_disconnect(connected_device);
 
+    outgoing_is_car_initiated = false;
     memset(current_phone_number, 0, sizeof(current_phone_number));
     ESP_LOGI(TAG, "📵 通话已结束");
 }
@@ -660,6 +686,7 @@ void handle_call_dial(const char *number)
 
     strncpy(current_phone_number, number, sizeof(current_phone_number) - 1);
     current_call_state = CALL_STATE_DIALING;
+    outgoing_is_car_initiated = true; // 车机 ATD 触发
     led_mode = 3; // 绿灯快闪
 
     // 通知车机外拨开始：callsetup=2 (OUTGOING_DIALING)
@@ -705,23 +732,33 @@ void handle_call_cancel_dial(void)
     current_call_state = CALL_STATE_IDLE;
     led_mode = 2; // 绿灯常亮
 
-    // 通知车机外拨已取消：call=0, callsetup=0
-    esp_hf_ag_end_call(
-        connected_device,
-        0,                                    // num_active=0
-        0,                                    // num_held=0
-        ESP_HF_CALL_STATUS_NO_CALLS,
-        ESP_HF_CALL_SETUP_STATUS_IDLE,
-        current_phone_number,
-        ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+    if (outgoing_is_car_initiated)
+    {
+        // 车机 ATD 路径：保持原 end_call 行为
+        esp_hf_ag_end_call(
+            connected_device,
+            0,                                    // num_active=0
+            0,                                    // num_held=0
+            ESP_HF_CALL_STATUS_NO_CALLS,
+            ESP_HF_CALL_SETUP_STATUS_IDLE,
+            current_phone_number,
+            ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+    }
+    else
+    {
+        // ESP32 主动外拨路径：只同步 CIEV 指标
+        sync_hfp_call_indicators(0, 0);
+    }
 
-    sync_hfp_call_indicators(0, 0);
     esp_hf_ag_audio_disconnect(connected_device);
+    outgoing_is_car_initiated = false;
     memset(current_phone_number, 0, sizeof(current_phone_number));
     ESP_LOGI(TAG, "📵 外拨已取消");
 }
 
 // ESP32 主动发起外拨（按键/旋钮触发）
+// 注意：这里不用 esp_hf_ag_out_call，避免部分车机将其归类为“网络电话”。
+// 仅通过 CIEV 指标推进：callsetup=2 -> callsetup=3 -> call=1, callsetup=0。
 void simulate_outgoing_call(const char *phone_number)
 {
     if (!hfp_connected)
@@ -745,8 +782,22 @@ void simulate_outgoing_call(const char *phone_number)
     }
     ESP_LOGI(TAG, "📞 ====================================");
 
-    // 复用 handle_call_dial：它会发送 OUTGOING_DIALING/ALERTING 状态
-    handle_call_dial(phone_number);
+    current_phone_number[0] = '\0';
+    strncpy(current_phone_number, phone_number, sizeof(current_phone_number) - 1);
+    current_call_state = CALL_STATE_DIALING;
+    outgoing_is_car_initiated = false; // ESP32 自发，不是 ATD
+    led_mode = 3; // 绿灯快闪
+
+    // 仅发送 CIEV 指标：callsetup=2 表示外拨中
+    sync_hfp_call_indicators(0, 2);
+
+    // 1 秒后切到 ALERTING
+    if (dialing_alerting_timer != NULL)
+    {
+        xTimerStop(dialing_alerting_timer, 0);
+        xTimerStart(dialing_alerting_timer, 0);
+    }
+    ESP_LOGI(TAG, "💡 等待对端接听：旋钮1→2→0可接通，旋钮1→3→0可取消");
 }
 
 /* ===================== HFP AG事件回调 ===================== */
@@ -800,6 +851,7 @@ static void hfp_ag_callback(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
             hfp_connected = false;
             memset(connected_device, 0, 6);
             current_call_state = CALL_STATE_IDLE;
+            outgoing_is_car_initiated = false;
             led_mode = 1; // 蓝灯慢闪
             esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
             ESP_LOGI(TAG, "HFP断开后恢复为可搜索状态，等待车机重新连接");
