@@ -70,7 +70,7 @@ typedef enum {
 
 static call_state_t current_call_state = CALL_STATE_IDLE;
 static char current_phone_number[32] = "";
-// static TimerHandle_t ring_timer = NULL;
+static TimerHandle_t outgoing_alert_timer = NULL;
 
 typedef struct
 {
@@ -114,6 +114,49 @@ static void sync_hfp_call_indicators(int call, int callsetup)
     esp_hf_ag_ciev_report(connected_device, ESP_HF_IND_TYPE_CALLSETUP, callsetup);
     esp_hf_ag_ciev_report(connected_device, ESP_HF_IND_TYPE_SERVICE, 1);
     esp_hf_ag_ciev_report(connected_device, ESP_HF_IND_TYPE_SIGNAL, 5);
+}
+
+static void outgoing_alert_timer_callback(TimerHandle_t xTimer)
+{
+    (void)xTimer;
+
+    if (!hfp_connected)
+    {
+        return;
+    }
+
+    if (current_call_state != CALL_STATE_DIALING)
+    {
+        return;
+    }
+
+    current_call_state = CALL_STATE_ALERTING;
+    ESP_LOGI(TAG, "📞 对方振铃中...");
+    esp_hf_ag_out_call(
+        connected_device,
+        0,
+        0,
+        ESP_HF_CALL_STATUS_NO_CALLS,
+        ESP_HF_CALL_SETUP_STATUS_OUTGOING_ALERTING,
+        current_phone_number,
+        ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+    sync_hfp_call_indicators(0, ESP_HF_CALL_SETUP_STATUS_OUTGOING_ALERTING);
+}
+
+static void stop_outgoing_alert_timer(void)
+{
+    if (outgoing_alert_timer != NULL)
+    {
+        xTimerStop(outgoing_alert_timer, 0);
+    }
+}
+
+static void clear_call_context(void)
+{
+    stop_outgoing_alert_timer();
+    current_call_state = CALL_STATE_IDLE;
+    led_mode = 2;
+    memset(current_phone_number, 0, sizeof(current_phone_number));
 }
 
 static void respond_current_calls(esp_bd_addr_t remote_addr)
@@ -474,6 +517,7 @@ void handle_call_answer(void)
             ESP_HF_CALL_SETUP_STATUS_IDLE,
             current_phone_number,
             ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+        sync_hfp_call_indicators(1, ESP_HF_CALL_SETUP_STATUS_IDLE);
 
         // sync_hfp_call_indicators(1, 0);
         esp_hf_ag_audio_connect(connected_device);
@@ -540,6 +584,7 @@ void handle_call_reject(void)
     //     xTimerStop(ring_timer, 0);
     // }
 
+    stop_outgoing_alert_timer();
     current_call_state = CALL_STATE_IDLE;
     led_mode = 2; // 绿灯常亮
 
@@ -563,7 +608,9 @@ void handle_call_reject(void)
 // 挂断电话
 void handle_call_hangup(void)
 {
-    if (current_call_state != CALL_STATE_ACTIVE)
+    if (current_call_state != CALL_STATE_ACTIVE &&
+        current_call_state != CALL_STATE_DIALING &&
+        current_call_state != CALL_STATE_ALERTING)
     {
         ESP_LOGW(TAG, "❌ 当前无通话，无法挂断");
         return;
@@ -579,6 +626,7 @@ void handle_call_hangup(void)
     }
     ESP_LOGI(TAG, "📴 ===============================");
 
+    stop_outgoing_alert_timer();
     current_call_state = CALL_STATE_IDLE;
     led_mode = 2; // 绿灯常亮
 
@@ -640,21 +688,14 @@ void handle_call_dial(const char *number)
         ESP_HF_CALL_SETUP_STATUS_OUTGOING_DIALING,    // 2
         current_phone_number,
         ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+    // 部分车机只盯 +CIEV，不完全依赖 out_call 事件；这里显式同步为“外拨拨号中”。
+    sync_hfp_call_indicators(0, ESP_HF_CALL_SETUP_STATUS_OUTGOING_DIALING);
 
-    // 模拟对方振铃
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    if (current_call_state == CALL_STATE_DIALING)
+    // 异步模拟对方振铃，避免阻塞HFP回调任务导致车机侧操作延迟
+    if (outgoing_alert_timer != NULL)
     {
-        current_call_state = CALL_STATE_ALERTING;
-        ESP_LOGI(TAG, "📞 对方振铃中...");
-        esp_hf_ag_out_call(
-            connected_device,
-            0,
-            0,
-            ESP_HF_CALL_STATUS_NO_CALLS,
-            ESP_HF_CALL_SETUP_STATUS_OUTGOING_ALERTING, // 3
-            current_phone_number,
-            ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
+        xTimerStop(outgoing_alert_timer, 0);
+        xTimerStart(outgoing_alert_timer, 0);
     }
 
     ESP_LOGI(TAG, "💡 等待对端接听：板子旋钮2→0可接通，旋钮3→0可取消");
@@ -710,7 +751,7 @@ static void hfp_ag_callback(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
         {
             hfp_connected = false;
             memset(connected_device, 0, 6);
-            current_call_state = CALL_STATE_IDLE;
+            clear_call_context();
             led_mode = 1; // 蓝灯慢闪
             esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
             ESP_LOGI(TAG, "HFP断开后恢复为可搜索状态，等待车机重新连接");
@@ -742,7 +783,9 @@ static void hfp_ag_callback(esp_hf_cb_event_t event, esp_hf_cb_param_t *param)
         {
             handle_call_reject();
         }
-        else if (current_call_state == CALL_STATE_ACTIVE)
+        else if (current_call_state == CALL_STATE_ACTIVE ||
+                 current_call_state == CALL_STATE_DIALING ||
+                 current_call_state == CALL_STATE_ALERTING)
         {
             handle_call_hangup();
         }
@@ -871,6 +914,7 @@ static esp_err_t bt_init(void)
     bool bluedroid_enabled = false;
     bool avrc_tg_inited = false;
     bool a2dp_inited = false;
+    bool outgoing_timer_created = false;
 
     // 初始化蓝牙控制器
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
@@ -925,6 +969,20 @@ static esp_err_t bt_init(void)
         goto fail;
     }
 
+    outgoing_alert_timer = xTimerCreate(
+        "out_alert",
+        pdMS_TO_TICKS(1000),
+        pdFALSE,
+        NULL,
+        outgoing_alert_timer_callback);
+    if (outgoing_alert_timer == NULL)
+    {
+        ESP_LOGE(TAG, "创建外拨振铃定时器失败");
+        ret = ESP_ERR_NO_MEM;
+        goto fail;
+    }
+    outgoing_timer_created = true;
+
     // 车机通常会把“手机”当作 A2DP Source + AVRCP Target + HFP AG 的组合设备看待。
     // 仅暴露 HFP AG 时，部分车机会因为缺少 AVDTP(PSM 25) 服务而主动断开。
     ret = esp_avrc_tg_init();
@@ -965,6 +1023,11 @@ static esp_err_t bt_init(void)
     return ESP_OK;
 
 fail:
+    if (outgoing_timer_created)
+    {
+        xTimerDelete(outgoing_alert_timer, 0);
+        outgoing_alert_timer = NULL;
+    }
     if (a2dp_inited)
     {
         esp_a2d_source_deinit();
@@ -991,6 +1054,12 @@ fail:
 
 static void bt_deinit(void)
 {
+    if (outgoing_alert_timer != NULL)
+    {
+        xTimerDelete(outgoing_alert_timer, 0);
+        outgoing_alert_timer = NULL;
+    }
+
     // 关闭HFP AG
     esp_hf_ag_deinit();
     esp_a2d_source_deinit();
@@ -1005,7 +1074,7 @@ static void bt_deinit(void)
     esp_bt_controller_deinit();
 
     hfp_connected = false;
-    current_call_state = CALL_STATE_IDLE;
+    clear_call_context();
 
     ESP_LOGI(TAG, "蓝牙已关闭");
 }
@@ -1030,7 +1099,7 @@ static void bt_cleanup_partial_init(void)
     a2dp_connected = false;
     avrcp_connected = false;
     negotiated_hfp_codec = -1;
-    current_call_state = CALL_STATE_IDLE;
+    clear_call_context();
 }
 
 /* ===================== 按键任务 ===================== */
@@ -1151,26 +1220,14 @@ static void switch_monitor_task(void *arg)
                 {
                     handle_call_reject();
                 }
-                else if (current_call_state == CALL_STATE_ACTIVE)
+                else if (current_call_state == CALL_STATE_ACTIVE ||
+                         current_call_state == CALL_STATE_ALERTING)
                 {
                     handle_call_hangup();
                 }
                 else if (current_call_state == CALL_STATE_DIALING)
                 {
-                    current_call_state = CALL_STATE_IDLE;
-                    led_mode = 2;
-                    esp_hf_ag_end_call(
-                        connected_device,
-                        0,
-                        0,
-                        ESP_HF_CALL_STATUS_NO_CALLS,
-                        ESP_HF_CALL_SETUP_STATUS_IDLE,
-                        current_phone_number,
-                        ESP_HF_CALL_ADDR_TYPE_UNKNOWN);
-                    sync_hfp_call_indicators(0, 0);
-                    esp_hf_ag_audio_disconnect(connected_device);
-                    memset(current_phone_number, 0, sizeof(current_phone_number));
-                    ESP_LOGI(TAG, "📵 外拨已取消");
+                    handle_call_hangup();
                 }
                 else
                 {
